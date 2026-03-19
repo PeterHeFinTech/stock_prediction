@@ -496,6 +496,67 @@ def cross_sectional_correlation(signal_1: Union[torch.Tensor, np.ndarray],
         return correlations
 
 
+def rank_information_coefficient(predictions: Union[torch.Tensor, np.ndarray],
+                                 actual_returns: Union[torch.Tensor, np.ndarray]) -> float:
+    """
+    Calculate Rank Information Coefficient (Rank IC).
+
+    Rank IC is Spearman rank correlation between model scores and realized returns.
+    """
+    if isinstance(predictions, torch.Tensor):
+        predictions = predictions.detach().cpu().numpy()
+    if isinstance(actual_returns, torch.Tensor):
+        actual_returns = actual_returns.detach().cpu().numpy()
+
+    predictions = np.asarray(predictions).flatten()
+    actual_returns = np.asarray(actual_returns).flatten()
+
+    if len(predictions) != len(actual_returns) or len(predictions) < 2:
+        return 0.0
+
+    # Remove NaN/Inf pairs
+    valid_mask = np.isfinite(predictions) & np.isfinite(actual_returns)
+    predictions = predictions[valid_mask]
+    actual_returns = actual_returns[valid_mask]
+
+    if len(predictions) < 2:
+        return 0.0
+
+    def _average_tie_ranks(x: np.ndarray) -> np.ndarray:
+        # Stable sort to preserve deterministic tie handling
+        sorter = np.argsort(x, kind='mergesort')
+        sorted_x = x[sorter]
+        n = len(sorted_x)
+        ranks_sorted = np.zeros(n, dtype=float)
+
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and sorted_x[j + 1] == sorted_x[i]:
+                j += 1
+            # 1-based average rank for ties
+            avg_rank = (i + j) / 2.0 + 1.0
+            ranks_sorted[i:j + 1] = avg_rank
+            i = j + 1
+
+        ranks = np.empty(n, dtype=float)
+        ranks[sorter] = ranks_sorted
+        return ranks
+
+    pred_ranks = _average_tie_ranks(predictions)
+    ret_ranks = _average_tie_ranks(actual_returns)
+
+    pred_std = np.std(pred_ranks, ddof=1)
+    ret_std = np.std(ret_ranks, ddof=1)
+    if pred_std < 1e-12 or ret_std < 1e-12:
+        return 0.0
+
+    ric = np.corrcoef(pred_ranks, ret_ranks)[0, 1]
+    if np.isnan(ric):
+        return 0.0
+    return float(ric)
+
+
 # =============================================================================
 # Additional Helper Functions
 # =============================================================================

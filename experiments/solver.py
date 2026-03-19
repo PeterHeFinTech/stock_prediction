@@ -12,7 +12,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.metrics import (
     sharpe_ratio, portfolio_turnover, net_of_cost_sharpe,
     long_short_portfolio_returns, cross_entropy_loss, mcfadden_pseudo_r2,
-    annualized_return, annualized_volatility, maximum_drawdown, decile_analysis
+    annualized_return, annualized_volatility, maximum_drawdown, decile_analysis,
+    rank_information_coefficient
 ) 
 
 
@@ -237,12 +238,11 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         # actual_return_pct = (price_129 - price_128) / price_128 * 100
         actual_return_pct = (np_day129_close - np_day128_close) / np_day128_close * 100
         
-        # 2 pip spread成本 (约0.02%)
-        spread_cost_pct = 0.02
+        # 1 pip spread成本 (约0.01%)
+        spread_cost_pct = 0.01
         
-        # 无风险利率: 年化 2% -> 单次交易(按日)收益率
-        risk_free_annual = 0.02
-        risk_free_per_trade_pct = ((1 + risk_free_annual) ** (1 / 252) - 1) * 100
+        # Hold cost: annual 2% distributed by calendar day
+        risk_free_per_trade_pct = (0.02 / 365) * 100
         
         for thresh in thresholds:
             # --- 分析 Up (涨) ---
@@ -338,70 +338,71 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         print(f"\n[{dataset_name}] Asset Pricing Metrics - Decile Analysis:", flush=True)
         print(f"{'-'*140}")
         
-        # 获取预测概率和实际收益
-        # 这里使用UP预测概率来排序（也可以使用综合概率）
         up_prob = np_probs[:, 2]
-        
-        # 计算实际回报（不考虑交易方向，用于ranking分析）
-        actual_returns = (np_day129_close - np_day128_close) / (np_day128_close + 1e-8) * 100 - 0.02  # 扣spread
-        
-        # 按UP预测概率从低到高排序，分成10个decile
-        sorted_indices = np.argsort(up_prob)
-        n_samples_decile = len(sorted_indices) // 10
-        
-        decile_stats = []
-        print(f"{'Decile':<10} | {'Count':<8} | {'Avg Return':<12} | {'Std Dev':<12} | {'Sharpe':<10} | {'Win Rate':<10} | {'Monotonic':<12}")
-        print(f"{'-'*140}")
-        
-        for decile_idx in range(10):
-            start_idx = decile_idx * n_samples_decile
-            if decile_idx == 9:  # 最后一个decile包含剩余所有样本
-                end_idx = len(sorted_indices)
-            else:
-                end_idx = (decile_idx + 1) * n_samples_decile
-            
-            decile_sample_indices = sorted_indices[start_idx:end_idx]
-            decile_returns = actual_returns[decile_sample_indices]
-            decile_labels = np_labels[decile_sample_indices]
-            
-            # 统计
-            avg_return = np.mean(decile_returns)
-            std_dev = np.std(decile_returns)
-            
-            # Sharpe ratio (using 2% annual rf)
-            excess_returns = decile_returns - risk_free_per_trade_pct
-            if len(decile_returns) > 1 and std_dev > 1e-8:
-                sharpe = (np.mean(excess_returns) / std_dev) * np.sqrt(len(decile_returns))
-            else:
-                sharpe = 0.0
-            
-            # Win rate (positive return ratio)
-            win_rate_decile = (np.sum(decile_returns > 0) / len(decile_returns)) * 100 if len(decile_returns) > 0 else 0
-            
-            decile_stats.append({
-                'decile': decile_idx + 1,
-                'count': len(decile_sample_indices),
-                'avg_return': avg_return,
-                'std_dev': std_dev,
-                'sharpe': sharpe,
-                'win_rate': win_rate_decile
-            })
-            
-            monotonic_check = "↑" if decile_idx > 0 and avg_return > decile_stats[decile_idx-1]['avg_return'] else "→" if decile_idx == 0 else "↓"
-            
-            print(f"D{decile_idx+1:<9} | {len(decile_sample_indices):<8} | {avg_return:+11.4f}% | {std_dev:11.4f}% | {sharpe:+9.3f} | {win_rate_decile:9.2f}% | {monotonic_check:<12}")
-        
-        print(f"{'-'*140}")
-        
-        # H-L Spread (Decile 10 - Decile 1)
-        h_l_spread = decile_stats[9]['avg_return'] - decile_stats[0]['avg_return']
-        monotonic_count = sum(1 for i in range(1, 10) if decile_stats[i]['avg_return'] > decile_stats[i-1]['avg_return'])
-        
-        print(f"\n[{dataset_name}] Portfolio Performance Summary:", flush=True)
-        print(f"  H-L Spread (Decile 10 - 1): {h_l_spread:+.4f}%", flush=True)
-        print(f"  Monotonicity (increasing deciles): {monotonic_count}/9 transitions", flush=True)
-        print(f"  Best Decile Sharpe: {max(s['sharpe'] for s in decile_stats):+.3f} (D{decile_stats.index(max(decile_stats, key=lambda x: x['sharpe']))+1})", flush=True)
-        print(f"  Worst Decile Sharpe: {min(s['sharpe'] for s in decile_stats):+.3f} (D{decile_stats.index(min(decile_stats, key=lambda x: x['sharpe']))+1})", flush=True)
+        down_prob = np_probs[:, 0]
+
+        # UP侧: LONG收益（扣spread）
+        up_side_returns = (np_day129_close - np_day128_close) / (np_day128_close + 1e-8) * 100 - spread_cost_pct
+        # DOWN侧: SHORT收益（扣spread）
+        down_side_returns = -(np_day129_close - np_day128_close) / (np_day128_close + 1e-8) * 100 - spread_cost_pct
+
+        def run_decile_table(score, returns, title):
+            sorted_indices = np.argsort(score)
+            n_samples_decile = len(sorted_indices) // 10
+
+            decile_stats = []
+            print(f"\n  {title}", flush=True)
+            print(f"{'Decile':<10} | {'Count':<8} | {'Avg Return':<12} | {'Std Dev':<12} | {'Sharpe':<10} | {'Win Rate':<10} | {'Monotonic':<12}")
+            print(f"{'-'*140}")
+
+            for decile_idx in range(10):
+                start_idx = decile_idx * n_samples_decile
+                if decile_idx == 9:
+                    end_idx = len(sorted_indices)
+                else:
+                    end_idx = (decile_idx + 1) * n_samples_decile
+
+                decile_sample_indices = sorted_indices[start_idx:end_idx]
+                decile_returns = returns[decile_sample_indices]
+
+                avg_return = np.mean(decile_returns)
+                std_dev = np.std(decile_returns)
+
+                excess_returns = decile_returns - risk_free_per_trade_pct
+                if len(decile_returns) > 1 and std_dev > 1e-8:
+                    sharpe = (np.mean(excess_returns) / std_dev) * np.sqrt(len(decile_returns))
+                else:
+                    sharpe = 0.0
+
+                win_rate_decile = (np.sum(decile_returns > 0) / len(decile_returns)) * 100 if len(decile_returns) > 0 else 0
+
+                decile_stats.append({
+                    'decile': decile_idx + 1,
+                    'count': len(decile_sample_indices),
+                    'avg_return': avg_return,
+                    'std_dev': std_dev,
+                    'sharpe': sharpe,
+                    'win_rate': win_rate_decile
+                })
+
+                monotonic_check = "↑" if decile_idx > 0 and avg_return > decile_stats[decile_idx-1]['avg_return'] else "→" if decile_idx == 0 else "↓"
+                print(f"D{decile_idx+1:<9} | {len(decile_sample_indices):<8} | {avg_return:+11.4f}% | {std_dev:11.4f}% | {sharpe:+9.3f} | {win_rate_decile:9.2f}% | {monotonic_check:<12}")
+
+            print(f"{'-'*140}")
+
+            h_l_spread = decile_stats[9]['avg_return'] - decile_stats[0]['avg_return']
+            monotonic_count = sum(1 for i in range(1, 10) if decile_stats[i]['avg_return'] > decile_stats[i-1]['avg_return'])
+            best_decile_idx = decile_stats.index(max(decile_stats, key=lambda x: x['sharpe'])) + 1
+            worst_decile_idx = decile_stats.index(min(decile_stats, key=lambda x: x['sharpe'])) + 1
+
+            print(f"  {title} Summary:", flush=True)
+            print(f"    H-L Spread (Decile 10 - 1): {h_l_spread:+.4f}%", flush=True)
+            print(f"    Monotonicity (increasing deciles): {monotonic_count}/9 transitions", flush=True)
+            print(f"    Best Decile Sharpe: {max(s['sharpe'] for s in decile_stats):+.3f} (D{best_decile_idx})", flush=True)
+            print(f"    Worst Decile Sharpe: {min(s['sharpe'] for s in decile_stats):+.3f} (D{worst_decile_idx})", flush=True)
+
+        run_decile_table(up_prob, up_side_returns, "UP Probability Ranked (LONG Returns)")
+        run_decile_table(down_prob, down_side_returns, "DOWN Probability Ranked (SHORT Returns)")
         
         # ==========================================================
         # Additional Comprehensive Metrics
@@ -416,14 +417,19 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         print(f"  Statistical Metrics:", flush=True)
         print(f"    Cross-Entropy Loss (UP class): {ce_loss:.6f}", flush=True)
         print(f"    McFadden's Pseudo R² (UP prediction): {pseudo_r2:.6f}", flush=True)
+
+        # Rank Information Coefficient (trend score vs realized next-step return)
+        trend_score = up_prob - down_prob
+        rank_ic = rank_information_coefficient(trend_score, actual_return_pct)
+        print(f"    Rank IC (trend score vs actual return): {rank_ic:+.6f}", flush=True)
         
         # Long-Short Portfolio Returns (using decile 10 vs decile 1)
         # Construct long-short portfolio
         long_mask = (up_prob >= np.percentile(up_prob, 90))  # Top 10%
         short_mask = (up_prob <= np.percentile(up_prob, 10))  # Bottom 10%
         
-        long_returns = actual_returns[long_mask]
-        short_returns = actual_returns[short_mask]
+        long_returns = up_side_returns[long_mask]
+        short_returns = up_side_returns[short_mask]
         
         if len(long_returns) > 0 and len(short_returns) > 0:
             long_short_returns = (long_returns.mean() - short_returns.mean())
@@ -446,19 +452,21 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         
         # Full portfolio metrics (all predictions)
         all_pred_classes = np.argmax(np_probs, axis=1)
-        all_strategy_returns = np.zeros_like(actual_returns)
+        all_strategy_returns = np.full_like(up_side_returns, np.nan)
         
         # UP predictions: long position
         up_pred_mask = (all_pred_classes == 2)
-        all_strategy_returns[up_pred_mask] = actual_returns[up_pred_mask]
+        all_strategy_returns[up_pred_mask] = up_side_returns[up_pred_mask]
         
         # DOWN predictions: short position
         down_pred_mask = (all_pred_classes == 0)
-        all_strategy_returns[down_pred_mask] = -actual_returns[down_pred_mask]
+        all_strategy_returns[down_pred_mask] = down_side_returns[down_pred_mask]
         
-        # STABLE predictions: no position (0 return minus spread)
+        # STABLE predictions: skip (do nothing, no spread deduction)
         stable_pred_mask = (all_pred_classes == 1)
-        all_strategy_returns[stable_pred_mask] = -spread_cost_pct
+        # Keep as NaN and drop below; no trade, no spread, no hold PnL contribution
+
+        all_strategy_returns = all_strategy_returns[~np.isnan(all_strategy_returns)]
         
         if len(all_strategy_returns) > 1:
             full_sharpe = sharpe_ratio(all_strategy_returns / 100, periods_per_year=252)
