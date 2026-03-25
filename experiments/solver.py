@@ -244,6 +244,9 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         # Hold cost: annual 2% distributed by calendar day
         risk_free_per_trade_pct = (0.02 / 365) * 100
         
+        # 无风险利率: 年化 2%
+        risk_free_annual = 0.02
+        
         for thresh in thresholds:
             # --- 分析 Up (涨) ---
             # 条件: 预测是 Up (索引2) 且 概率 > 阈值
@@ -270,8 +273,11 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 
                 # 计算 Sharpe Ratio
                 if len(returns_pct) > 1 and volatility_pct > 0:
-                    excess_returns_pct = returns_pct - risk_free_per_trade_pct
-                    sharpe = (np.mean(excess_returns_pct) / volatility_pct) * np.sqrt(len(returns_pct))
+                    sharpe = sharpe_ratio(
+                        returns_pct / 100,
+                        risk_free_rate=risk_free_annual,
+                        periods_per_year=252
+                    )
                 else:
                     sharpe = 0.0
                 
@@ -313,8 +319,11 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 
                 # 计算 Sharpe Ratio
                 if len(returns_pct) > 1 and volatility_pct > 0:
-                    excess_returns_pct = returns_pct - risk_free_per_trade_pct
-                    sharpe = (np.mean(excess_returns_pct) / volatility_pct) * np.sqrt(len(returns_pct))
+                    sharpe = sharpe_ratio(
+                        returns_pct / 100,
+                        risk_free_rate=risk_free_annual,
+                        periods_per_year=252
+                    )
                 else:
                     sharpe = 0.0
                 
@@ -368,9 +377,12 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 avg_return = np.mean(decile_returns)
                 std_dev = np.std(decile_returns)
 
-                excess_returns = decile_returns - risk_free_per_trade_pct
                 if len(decile_returns) > 1 and std_dev > 1e-8:
-                    sharpe = (np.mean(excess_returns) / std_dev) * np.sqrt(len(decile_returns))
+                    sharpe = sharpe_ratio(
+                        decile_returns / 100,
+                        risk_free_rate=risk_free_annual,
+                        periods_per_year=252
+                    )
                 else:
                     sharpe = 0.0
 
@@ -443,11 +455,11 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
             
             # Sharpe ratios
             if len(long_returns) > 1:
-                long_sharpe = sharpe_ratio(long_returns / 100, periods_per_year=252)  # Convert % to decimal
+                long_sharpe = sharpe_ratio(long_returns / 100, risk_free_rate=risk_free_annual, periods_per_year=252)  # Convert % to decimal
                 print(f"    Long Portfolio Sharpe: {long_sharpe:.4f}", flush=True)
             
             if len(short_returns) > 1:
-                short_sharpe = sharpe_ratio(-short_returns / 100, periods_per_year=252)  # Short position
+                short_sharpe = sharpe_ratio(-short_returns / 100, risk_free_rate=risk_free_annual, periods_per_year=252)  # Short position
                 print(f"    Short Portfolio Sharpe: {short_sharpe:.4f}", flush=True)
         
         # Full portfolio metrics (all predictions)
@@ -469,7 +481,7 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         all_strategy_returns = all_strategy_returns[~np.isnan(all_strategy_returns)]
         
         if len(all_strategy_returns) > 1:
-            full_sharpe = sharpe_ratio(all_strategy_returns / 100, periods_per_year=252)
+            full_sharpe = sharpe_ratio(all_strategy_returns / 100, risk_free_rate=risk_free_annual, periods_per_year=252)
             full_ann_return = annualized_return(all_strategy_returns / 100, periods_per_year=252)
             full_ann_vol = annualized_volatility(all_strategy_returns / 100, periods_per_year=252)
             full_max_dd = maximum_drawdown(all_strategy_returns / 100)
